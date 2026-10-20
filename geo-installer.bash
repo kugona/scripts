@@ -109,7 +109,7 @@ import tempfile
 import zipfile
 
 archive, target = sys.argv[1:]
-regions = {'09': 'Luhansk', '14': 'Donetsk', '65': 'Kherson', '23': 'Zaporizhzhia'}
+regions = {'09': 'Luhansk', '14': 'Donetsk', '65': 'Kherson', '23': 'Zaporizhzhia', '43': 'Crimea', '40': 'Sevastopol'}
 counts = collections.Counter()
 with zipfile.ZipFile(archive) as z:
     def rows(suffix):
