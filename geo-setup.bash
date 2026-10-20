@@ -8,17 +8,19 @@ license_key=
 out=./allowed.cidrs
 out_set=false
 backend=
+exclude_ips='[]'
 mode=--apply
 for arg in "$@"; do
     case $arg in
         --account_id=*|--account-id=*) account_id=${arg#*=} ;;
         --license_key=*|--license-key=*|-license_key=*) license_key=${arg#*=} ;;
         --firewall=*) backend=${arg#*=} ;;
+        --exclude_ip=*) exclude_ips=${arg#*=} ;;
         --check) mode=--check ;;
         --rollback) mode=--remove ;;
         --output=*) out=${arg#*=}; out_set=true ;;
         -h|--help)
-            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--firewall=ufw|iptables|nftables] [--output=FILE|FILE] [--check|--rollback]'
+            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--firewall=ufw|iptables|nftables] [--exclude_ip=["1.1.1.1","::1"]] [--output=FILE|FILE] [--check|--rollback]'
             exit 0 ;;
         -*) echo "Неизвестный параметр: ${arg%%=*}" >&2; exit 1 ;;
         *)
@@ -116,6 +118,29 @@ if [[ $backend == ufw ]] && ufw_is_active; then
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
+python3 - "$exclude_ips" "$tmp/excluded.cidrs" <<'PY'
+import ipaddress
+import json
+import pathlib
+import sys
+
+raw, target = sys.argv[1:]
+try:
+    values = json.loads(raw)
+except json.JSONDecodeError:
+    # Bash removes inner quotes in --exclude_ip=["1.1.1.1"]. Accept that spelling.
+    if not (raw.startswith('[') and raw.endswith(']')):
+        raise SystemExit('--exclude_ip: ожидается список IP в квадратных скобках')
+    values = [v.strip() for v in raw[1:-1].split(',')] if raw[1:-1].strip() else []
+if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+    raise SystemExit('--exclude_ip: ожидается список строк с IP-адресами')
+try:
+    addresses = sorted(set(map(ipaddress.ip_address, values)), key=lambda a: (a.version, int(a)))
+except ValueError as error:
+    raise SystemExit(f'--exclude_ip: {error}')
+pathlib.Path(target).write_text(''.join(f'{a}/{a.max_prefixlen}\n' for a in addresses))
+print(f'Исключений из геофильтра: {len(addresses)}')
+PY
 if [[ $mode != --remove ]]; then
 # Keep credentials out of curl's process arguments. Do not run with bash -x.
 printf 'machine download.maxmind.com login %s password %s\n' \
@@ -189,6 +214,8 @@ PY
 
 rm -f -- "$tmp/netrc"
 cp -- "$out" "$tmp/allowed.cidrs"
+# Exceptions join the firewall allowlist only; the downloaded GeoIP file stays geographic.
+cat "$tmp/excluded.cidrs" >> "$tmp/allowed.cidrs"
 fi
 if [[ $backend == nftables ]]; then
 if nft list table inet geo_web >/dev/null 2>&1; then
