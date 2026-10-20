@@ -72,9 +72,13 @@ for cmd in python3 flock "${dependencies[@]}"; do
 done
 exec 9>/run/geo-web.lock
 flock -x 9
+ufw_is_active() {
+    # Drain the complete output: head/grep -q can cause SIGPIPE under pipefail.
+    LC_ALL=C ufw status | grep -x 'Status: active' >/dev/null
+}
 # UFW must already be active; enabling it could change access to other ports.
 if [[ $backend == ufw ]]; then
-    LC_ALL=C ufw status | head -n 1 | grep -qx 'Status: active' || {
+    ufw_is_active || {
         echo 'UFW должен быть уже включен и настроен (включая SSH).' >&2; exit 1;
     }
     grep -Eq '^IPV6=yes$' /etc/default/ufw || {
@@ -288,7 +292,7 @@ PY
         cp -p /etc/ufw/before6.rules /etc/ufw/before6.rules.geo-access.bak
         cat "$tmp/new4" > /etc/ufw/before.rules
         cat "$tmp/new6" > /etc/ufw/before6.rules
-        if ! ufw reload || ! LC_ALL=C ufw status | grep -qx 'Status: active'; then
+        if ! ufw reload || ! ufw_is_active; then
             echo 'Ошибка UFW; восстанавливаю прежние файлы и активное состояние.' >&2
             cat "$tmp/old4" > /etc/ufw/before.rules
             cat "$tmp/old6" > /etc/ufw/before6.rules
