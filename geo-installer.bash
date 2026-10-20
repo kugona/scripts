@@ -15,9 +15,10 @@ for arg in "$@"; do
         --license_key=*|--license-key=*|-license_key=*) license_key=${arg#*=} ;;
         --firewall=*) backend=${arg#*=} ;;
         --check) mode=--check ;;
+        --rollback) mode=--remove ;;
         --output=*) out=${arg#*=}; out_set=true ;;
         -h|--help)
-            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--firewall=ufw|iptables|nftables] [--output=FILE|FILE] [--check]'
+            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--firewall=ufw|iptables|nftables] [--output=FILE|FILE] [--check|--rollback]'
             exit 0 ;;
         -*) echo "Неизвестный параметр: ${arg%%=*}" >&2; exit 1 ;;
         *)
@@ -26,6 +27,7 @@ for arg in "$@"; do
     esac
 done
 [[ $EUID -eq 0 ]] || { echo 'Запустите скрипт от root или через sudo bash.' >&2; exit 1; }
+if [[ $mode != --remove ]]; then
 for cmd in curl python3; do command -v "$cmd" >/dev/null; done
 if [[ -z $account_id || -z $license_key ]]; then
     # stdin may contain Bash source when launched through curl | bash.
@@ -45,6 +47,7 @@ fi
 [[ $account_id =~ ^[0-9]+$ ]] || { echo 'Account ID должен состоять из цифр.' >&2; exit 1; }
 [[ $license_key =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Пустой ключ или недопустимые символы.' >&2; exit 1; }
 [[ -n $out ]] || { echo 'Укажите выходной файл.' >&2; exit 1; }
+fi
 if [[ -z $backend ]]; then
     exec 8<>/dev/tty || { echo 'Нет терминала. Передайте --firewall=ufw|iptables|nftables' >&2; exit 1; }
     printf 'Выберите firewall:\n1) UFW\n2) iptables\n3) nftables\n' >&8
@@ -77,7 +80,7 @@ ufw_is_active() {
     LC_ALL=C ufw status | grep -x 'Status: active' >/dev/null
 }
 # UFW must already be active; enabling it could change access to other ports.
-if [[ $backend == ufw ]]; then
+if [[ $backend == ufw && $mode != --remove ]]; then
     ufw_is_active || {
         echo 'UFW должен быть уже включен и настроен (включая SSH).' >&2; exit 1;
     }
@@ -86,8 +89,34 @@ if [[ $backend == ufw ]]; then
     }
 fi
 
+if [[ $mode == --remove && $backend == nftables ]]; then
+    if nft list table inet geo_web >/dev/null 2>&1; then
+        nft delete table inet geo_web
+    fi
+    echo 'Геофильтр nftables удалён.'
+    exit
+fi
+if [[ $mode == --remove && $backend == iptables ]]; then
+    for tool in iptables ip6tables; do
+        while "$tool" -w -C INPUT -j GEO_WEB 2>/dev/null; do
+            "$tool" -w -D INPUT -j GEO_WEB
+        done
+        if "$tool" -w -S GEO_WEB >/dev/null 2>&1; then
+            "$tool" -w -F GEO_WEB
+            "$tool" -w -X GEO_WEB
+        fi
+    done
+    echo 'Геофильтр iptables удалён.'
+    exit
+fi
+# Remember whether UFW was active; rollback must not enable an inactive firewall.
+ufw_was_active=false
+if [[ $backend == ufw ]] && ufw_is_active; then
+    ufw_was_active=true
+fi
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
+if [[ $mode != --remove ]]; then
 # Keep credentials out of curl's process arguments. Do not run with bash -x.
 printf 'machine download.maxmind.com login %s password %s\n' \
     "$account_id" "$license_key" > "$tmp/netrc"
@@ -160,6 +189,7 @@ PY
 
 rm -f -- "$tmp/netrc"
 cp -- "$out" "$tmp/allowed.cidrs"
+fi
 if [[ $backend == nftables ]]; then
 if nft list table inet geo_web >/dev/null 2>&1; then
     echo 'delete table inet geo_web' > "$tmp/rules.nft"
@@ -292,7 +322,7 @@ PY
         cp -p /etc/ufw/before6.rules /etc/ufw/before6.rules.geo-access.bak
         cat "$tmp/new4" > /etc/ufw/before.rules
         cat "$tmp/new6" > /etc/ufw/before6.rules
-        if ! ufw reload || ! ufw_is_active; then
+        if [[ $ufw_was_active == true ]] && { ! ufw reload || ! ufw_is_active; }; then
             echo 'Ошибка UFW; восстанавливаю прежние файлы и активное состояние.' >&2
             cat "$tmp/old4" > /etc/ufw/before.rules
             cat "$tmp/old6" > /etc/ufw/before6.rules
