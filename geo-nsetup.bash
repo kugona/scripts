@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download GeoLite2 City and restrict host ports 80/443 using the selected firewall.
+# Download GeoLite2 City and restrict selected host ports using the selected firewall.
 set +x
 set -euo pipefail
 umask 077
@@ -9,6 +9,7 @@ out=./allowed.cidrs
 out_set=false
 backend=
 exclude_ips='[]'
+ports=80,443
 mode=--apply
 for arg in "$@"; do
     case $arg in
@@ -16,11 +17,12 @@ for arg in "$@"; do
         --license_key=*|--license-key=*|-license_key=*) license_key=${arg#*=} ;;
         --firewall=*) backend=${arg#*=} ;;
         --exclude_ip=*) exclude_ips=${arg#*=} ;;
+        --ports=*) ports=${arg#*=} ;;
         --check) mode=--check ;;
         --rollback) mode=--remove ;;
         --output=*) out=${arg#*=}; out_set=true ;;
         -h|--help)
-            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--firewall=ufw|iptables|nftables] [--exclude_ip=["1.1.1.1","::1"]] [--output=FILE|FILE] [--check|--rollback]'
+            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--firewall=ufw|iptables|nftables] [--ports=80,443,8443] [--exclude_ip=["1.1.1.1","::1"]] [--output=FILE|FILE] [--check|--rollback]'
             exit 0 ;;
         -*) echo "Неизвестный параметр: ${arg%%=*}" >&2; exit 1 ;;
         *)
@@ -81,6 +83,31 @@ ufw_is_active() {
     # Drain the complete output: head/grep -q can cause SIGPIPE under pipefail.
     LC_ALL=C ufw status | grep -x 'Status: active' >/dev/null
 }
+ufw_geo_is_installed() {
+    local tool chain first proto address batch
+    for tool in iptables ip6tables; do
+        chain=ufw-before-input
+        [[ $tool == ip6tables ]] && chain=ufw6-before-input
+        first=$("$tool" -w -S "$chain" | awk '/^-A / && !seen++ {print}') || return 1
+        [[ $first == "-A $chain -j GEO_WEB" ]] || return 1
+        "$tool" -w -C INPUT -j "$chain" || return 1
+        for proto in tcp udp; do
+            while IFS= read -r batch; do
+                "$tool" -w -C GEO_WEB -p "$proto" -m multiport --dports "$batch" -j DROP || return 1
+            done < "$tmp/port-batches"
+        done
+    done
+    while IFS= read -r address; do
+        tool=iptables
+        [[ $address == *:* ]] && tool=ip6tables
+        for proto in tcp udp; do
+            while IFS= read -r batch; do
+                "$tool" -w -C GEO_WEB -p "$proto" -m multiport --dports "$batch" \
+                    -s "$address" -m comment --comment geo-exception -j ACCEPT || return 1
+            done < "$tmp/port-batches"
+        done
+    done < "$tmp/excluded.cidrs"
+}
 # UFW must already be active; enabling it could change access to other ports.
 if [[ $backend == ufw && $mode != --remove ]]; then
     ufw_is_active || {
@@ -118,6 +145,23 @@ if [[ $backend == ufw ]] && ufw_is_active; then
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
+python3 - "$ports" "$tmp" <<'PY'
+import pathlib
+import re
+import sys
+
+raw, directory = sys.argv[1:]
+parts = raw.split(',')
+if any(not re.fullmatch(r'[0-9]{1,5}', p.strip()) for p in parts):
+    raise SystemExit('--ports: укажите номера портов через запятую, например 80,443,8443')
+ports = sorted({int(p) for p in parts})
+if any(p < 1 or p > 65535 for p in ports):
+    raise SystemExit('--ports: допустимы номера от 1 до 65535')
+root = pathlib.Path(directory)
+(root / 'ports').write_text(','.join(map(str, ports)))
+(root / 'port-batches').write_text(''.join(','.join(map(str, ports[i:i+15])) + '\n' for i in range(0, len(ports), 15)))
+print('Порты геофильтра (TCP/UDP):', ','.join(map(str, ports)))
+PY
 python3 - "$exclude_ips" "$tmp/excluded.cidrs" <<'PY'
 import ipaddress
 import json
@@ -214,16 +258,17 @@ PY
 
 rm -f -- "$tmp/netrc"
 cp -- "$out" "$tmp/allowed.cidrs"
-# Exceptions join the firewall allowlist only; the downloaded GeoIP file stays geographic.
-cat "$tmp/excluded.cidrs" >> "$tmp/allowed.cidrs"
+# Keep exceptions separate from geographic networks and emit exact source rules.
 fi
 if [[ $backend == nftables ]]; then
 if nft list table inet geo_web >/dev/null 2>&1; then
     echo 'delete table inet geo_web' > "$tmp/rules.nft"
 fi
-python3 - "$tmp/allowed.cidrs" >> "$tmp/rules.nft" <<'PY'
+python3 - "$tmp/allowed.cidrs" "$tmp/excluded.cidrs" "$tmp/ports" >> "$tmp/rules.nft" <<'PY'
 import ipaddress
 import sys
+with open(sys.argv[3], encoding='ascii') as f:
+    ports = ', '.join(f.read().strip().split(','))
 networks = {4: [], 6: []}
 with open(sys.argv[1], encoding='ascii') as f:
     for line in f:
@@ -244,10 +289,18 @@ print(' chain input { type filter hook input priority -10; policy accept;')
 print('  iifname "lo" accept')
 # Replies to connections initiated by this host are not incoming service access.
 print('  ct direction reply accept')
+with open(sys.argv[2], encoding='ascii') as f:
+    for line in f:
+        net = ipaddress.ip_network(line.strip())
+        if net.prefixlen != net.max_prefixlen:
+            raise ValueError('Exception must be a single IP')
+        family = 'ip' if net.version == 4 else 'ip6'
+        for protocol in ('tcp', 'udp'):
+            print(f'  {protocol} dport {{ {ports} }} {family} saddr {net} counter accept')
 for protocol in ('tcp', 'udp'):
-    print(f'  {protocol} dport {{ 80, 443 }} ip saddr @allowed4 counter accept')
-    print(f'  {protocol} dport {{ 80, 443 }} ip6 saddr @allowed6 counter accept')
-    print(f'  {protocol} dport {{ 80, 443 }} counter drop')
+    print(f'  {protocol} dport {{ {ports} }} ip saddr @allowed4 counter accept')
+    print(f'  {protocol} dport {{ {ports} }} ip6 saddr @allowed6 counter accept')
+    print(f'  {protocol} dport {{ {ports} }} counter drop')
 print(' }\n}')
 PY
 nft --check --file "$tmp/rules.nft"
@@ -276,7 +329,18 @@ import re
 import sys
 root = pathlib.Path(sys.argv[1])
 backend, mode = sys.argv[2:]
+ports_file = root / 'ports'
+ports = ports_file.read_text().strip().split(',') if ports_file.exists() else ['80', '443']
+port_batches = [','.join(ports[i:i+15]) for i in range(0, len(ports), 15)]
 nets = {4: [], 6: []}
+exceptions = {4: [], 6: []}
+exception_file = root / 'excluded.cidrs'
+if exception_file.exists():
+    for line in exception_file.read_text().splitlines():
+        n = ipaddress.ip_network(line)
+        if n.prefixlen != n.max_prefixlen:
+            raise ValueError('Exception must be a single IP')
+        exceptions[n.version].append(n)
 if mode != '--remove':
     for line in (root / 'allowed.cidrs').read_text().splitlines():
         n = ipaddress.ip_network(line)
@@ -288,11 +352,16 @@ if mode != '--remove':
 for v in (4, 6):
     rules = [':GEO_WEB - [0:0]', '-A GEO_WEB -i lo -j RETURN',
              '-A GEO_WEB -m conntrack --ctdir REPLY -j RETURN']
+    for n in exceptions[v]:
+        for proto in ('tcp', 'udp'):
+            for batch in port_batches:
+                rules.append(f'-A GEO_WEB -p {proto} -m multiport --dports {batch} -s {n} -m comment --comment geo-exception -j ACCEPT')
     for proto in ('tcp', 'udp'):
-        # Only web packets enter this chain's accept/drop logic.
-        for n in ipaddress.collapse_addresses(nets[v]):
-            rules.append(f'-A GEO_WEB -p {proto} -m multiport --dports 80,443 -s {n} -j ACCEPT')
-        rules.append(f'-A GEO_WEB -p {proto} -m multiport --dports 80,443 -j DROP')
+        # Apply to selected ports only. multiport accepts at most 15 ports per rule.
+        for batch in port_batches:
+            for n in ipaddress.collapse_addresses(nets[v]):
+                rules.append(f'-A GEO_WEB -p {proto} -m multiport --dports {batch} -s {n} -j ACCEPT')
+            rules.append(f'-A GEO_WEB -p {proto} -m multiport --dports {batch} -j DROP')
     old = (root / f'old{v}').read_text()
     if backend == 'iptables':
         # Modify only our own chain, keeping the rest of the filter table.
@@ -349,7 +418,8 @@ PY
         cp -p /etc/ufw/before6.rules /etc/ufw/before6.rules.geo-access.bak
         cat "$tmp/new4" > /etc/ufw/before.rules
         cat "$tmp/new6" > /etc/ufw/before6.rules
-        if [[ $ufw_was_active == true ]] && { ! ufw reload || ! ufw_is_active; }; then
+        if [[ $ufw_was_active == true ]] && { ! ufw reload || ! ufw_is_active ||
+            { [[ $mode != --remove ]] && ! ufw_geo_is_installed; }; }; then
             echo 'Ошибка UFW; восстанавливаю прежние файлы и активное состояние.' >&2
             cat "$tmp/old4" > /etc/ufw/before.rules
             cat "$tmp/old6" > /etc/ufw/before6.rules
