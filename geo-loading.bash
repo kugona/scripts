@@ -1,16 +1,51 @@
 #!/usr/bin/env bash
 # Download GeoLite2 City and build an IPv4/IPv6 allowlist.
+set +x
 set -euo pipefail
 umask 077
-: "${MAXMIND_ACCOUNT_ID:?Set MAXMIND_ACCOUNT_ID}"
-: "${MAXMIND_LICENSE_KEY:?Set MAXMIND_LICENSE_KEY}"
-out=${1:-./allowed.cidrs}
+account_id=
+license_key=
+out=./allowed.cidrs
+out_set=false
+for arg in "$@"; do
+    case $arg in
+        --account_id=*|--account-id=*) account_id=${arg#*=} ;;
+        --license_key=*|--license-key=*|-license_key=*) license_key=${arg#*=} ;;
+        --output=*) out=${arg#*=}; out_set=true ;;
+        -h|--help)
+            printf '%s\n' 'Usage: bash download-geo.sh [--account_id=ID] [--license_key=KEY] [--output=FILE|FILE]'
+            exit 0 ;;
+        -*) echo "Неизвестный параметр: ${arg%%=*}" >&2; exit 1 ;;
+        *)
+            [[ $out_set == false ]] || { echo 'Укажите только один выходной файл.' >&2; exit 1; }
+            out=$arg; out_set=true ;;
+    esac
+done
 for cmd in curl python3; do command -v "$cmd" >/dev/null; done
+if [[ -z $account_id || -z $license_key ]]; then
+    # stdin may contain Bash source when launched through curl | bash.
+    exec 8<>/dev/tty || {
+        echo 'Нет терминала. Передайте --account_id=... и --license_key=...' >&2
+        exit 1
+    }
+    if [[ -z $account_id ]]; then
+        read -r -u 8 -p 'Введите MaxMind Account ID: ' account_id
+    fi
+    if [[ -z $license_key ]]; then
+        read -r -s -u 8 -p 'Введите MaxMind License Key: ' license_key
+        printf '\n' >&8
+    fi
+    exec 8>&-
+fi
+[[ $account_id =~ ^[0-9]+$ ]] || { echo 'Account ID должен состоять из цифр.' >&2; exit 1; }
+[[ $license_key =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Пустой ключ или недопустимые символы.' >&2; exit 1; }
+[[ -n $out ]] || { echo 'Укажите выходной файл.' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 # Keep credentials out of curl's process arguments. Do not run with bash -x.
 printf 'machine download.maxmind.com login %s password %s\n' \
-    "$MAXMIND_ACCOUNT_ID" "$MAXMIND_LICENSE_KEY" > "$tmp/netrc"
+    "$account_id" "$license_key" > "$tmp/netrc"
+unset account_id license_key
 curl --fail --silent --show-error --location --retry 3 \
     --connect-timeout 30 --max-time 1800 --proto '=https' --proto-redir '=https' \
     --netrc-file "$tmp/netrc" \
